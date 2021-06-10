@@ -1,0 +1,397 @@
+
+#include <Arduino.h>
+#include <SerialCommand.h>
+SerialCommand sCmd;
+// #include <AltSoftSerial.h>
+// For RAMPS 1.4
+#define X_DIR_PIN          5
+#define X_STEP_PIN         2
+#define X_ENABLE_PIN       8
+#define X_LIMIT            9
+
+#define Y_DIR_PIN          6
+#define Y_STEP_PIN         3
+#define Y_ENABLE_PIN       8
+#define Y_LIMIT            10
+
+#define Z_DIR_PIN          7
+#define Z_STEP_PIN         4
+#define Z_ENABLE_PIN       8
+#define Z_LIMIT            11
+
+#define pinServo                11
+
+
+
+// const int stepPin = 2;
+// const int dirPin = 5;
+
+#define X_STEP_HIGH        PORTD |=  0b00000100;
+#define X_STEP_LOW         PORTD &= ~0b00000100;
+#define Y_STEP_HIGH        PORTD |=  0b00001000;
+#define Y_STEP_LOW         PORTD &= ~0b00001000;
+#define Z_STEP_HIGH        PORTD |=  0b00010000;
+#define Z_STEP_LOW         PORTD &= ~0b00010000;
+
+
+#define TIMER1_INTERRUPTS_ON    TIMSK1 |=  (1 << OCIE1A);
+#define TIMER1_INTERRUPTS_OFF   TIMSK1 &= ~(1 << OCIE1A);
+
+
+
+struct stepperInfo {
+  // externally defined parameters
+  float acceleration;
+  float SpeedSlow;
+  float SpeedFast;
+  volatile unsigned int minStepInterval;   // ie. max speed, smaller is faster
+  void (*dirFunc)(int);
+  void (*stepFunc)();
+
+  // derived parameters
+  unsigned int c0;                // step interval for first step, determines acceleration
+  long stepPosition;              // current position of stepper (total of all movements taken so far)
+
+  // per movement variables (only changed once per movement)
+  volatile int dir;                        // current direction of movement, used to keep track of position
+  volatile unsigned int totalSteps;        // number of steps requested for current movement
+  volatile bool movementDone = false;      // true if the current movement has been completed (used by main program to wait for completion)
+  volatile unsigned int rampUpStepCount;   // number of steps taken to reach either max speed, or half-way to the goal (will be zero until this number is known)
+
+  // per iteration variables (potentially changed every interrupt)
+  volatile unsigned int n;                 // index in acceleration curve, used to calculate next interval
+  volatile float d;                        // current interval length
+  volatile unsigned long di;               // above variable truncated
+  volatile unsigned int stepCount;         // number of steps completed in current movement
+  volatile int END_STOP_PIN;
+  float RealPosition;
+  float StepRatio;
+  int MaxPosition;
+};
+
+volatile stepperInfo Motor[3];
+int ActiveMotor;
+
+void xStep() {
+  X_STEP_LOW;
+   // delayMicroseconds(50);
+  X_STEP_HIGH;
+}
+void xDir(int dir) {
+  digitalWrite(X_DIR_PIN, dir);
+}
+
+void yStep() {
+  Y_STEP_LOW;
+  // delayMicroseconds(50);
+  Y_STEP_HIGH;
+}
+void yDir(int dir) {
+  digitalWrite(Y_DIR_PIN, dir);
+}
+
+void zStep() {
+  Z_STEP_LOW;
+  // delayMicroseconds(50);
+  Z_STEP_HIGH;
+}
+void zDir(int dir) {
+  digitalWrite(Z_DIR_PIN, dir);
+}
+
+volatile bool AirB=false;
+volatile bool AOpen=false;
+float PSTART;
+float PSTOP;
+
+void MotorMoveABS( int ,float , int);
+void setNextInterruptInterval(){
+  // OCR1A = Motor[ActiveMotor].SpeedSlow;
+  if ( ! Motor[ActiveMotor].movementDone ){
+     OCR1A = Motor[ActiveMotor].SpeedFast;
+   }else{
+      OCR1A = 65500;
+  }
+}
+
+ISR(TIMER1_COMPA_vect){
+  volatile stepperInfo& s = Motor[ActiveMotor];
+
+  OCR1A = 65500;
+
+  if ( s.stepCount < s.totalSteps ) {
+    s.stepFunc();
+    s.stepCount++;
+    s.stepPosition += s.dir;
+    s.RealPosition += s.dir*s.StepRatio;
+    if ( (s.stepCount >= s.totalSteps) || digitalRead(s.END_STOP_PIN)==0 ) {
+      s.movementDone = true;
+    }
+    else{
+      setNextInterruptInterval();
+    }
+  }
+  TCNT1  = 0;
+}
+
+void movePulse(int x){
+    int del=(11*x)+500;
+    for (int pulseCounter=0; pulseCounter<=50; pulseCounter++){
+        digitalWrite(pinServo,HIGH);
+        delayMicroseconds(del);
+        digitalWrite(pinServo,LOW);
+        delay(10); // between pulses
+    }
+}
+
+void MotorMove( int whichMotor,long steps, int acc=200){
+  if ( steps != 0){
+    TIMER1_INTERRUPTS_ON
+    ActiveMotor = whichMotor;
+    volatile stepperInfo& si = Motor[whichMotor];
+    si.dirFunc( steps < 0 ? HIGH : LOW );
+    si.dir = steps > 0 ? 1 : -1;
+    si.totalSteps = abs(steps);
+    si.minStepInterval = acc;
+    si.movementDone = false;
+    si.stepCount=0;
+
+    setNextInterruptInterval( );
+    while(!si.movementDone);
+    Serial.print(" :: "); Serial.println(si.RealPosition );
+    // TIMER1_INTERRUPTS_OFF
+    }
+}
+
+void MotorMoveMM( int whichMotor,float newposition, int acc=200){
+  ActiveMotor = whichMotor;
+  volatile stepperInfo& si = Motor[whichMotor];
+  if( newposition <= si.MaxPosition  ){
+      // Serial.print("\nMotorMove_MM: Motor:"); Serial.println(whichMotor);
+      // Serial.print(" - current position: "); Serial.println(si.RealPosition );
+      // Serial.print(" - move to position: "); Serial.println(newposition );
+      // Serial.print(" - to do: "); Serial.println((newposition-si.RealPosition)/si.StepRatio);
+      MotorMove(whichMotor,(newposition-si.RealPosition)/si.StepRatio,acc);
+    } else{
+      Serial.print("\nMotorMoveMM: "); Serial.println(whichMotor);
+      Serial.print(" :: ERR: "); Serial.print(newposition);Serial.print(" >> "); Serial.println(si.RealPosition );
+    }
+}
+
+void MotorMoveABS( int whichMotor,float newposition, int acc=200){
+  ActiveMotor = whichMotor;
+  volatile stepperInfo& si = Motor[whichMotor];
+  if( si.RealPosition+newposition < si.MaxPosition ){
+      // Serial.print("\nMotorMove_ABS: Motor:"); Serial.println(whichMotor);
+      // Serial.print(" - current position: "); Serial.println(si.RealPosition );
+      // Serial.print(" - move to position: "); Serial.println(si.RealPosition+newposition );
+      // Serial.print(" - to do: "); Serial.println((newposition)/si.StepRatio);
+      MotorMove(whichMotor,(newposition)/si.StepRatio,acc);
+    } else{
+      Serial.print("MotorMoveMM: "); Serial.println(whichMotor);
+      Serial.print(" ERR: "); Serial.print(newposition);Serial.print(" >> "); Serial.println(si.RealPosition );
+    }
+}
+
+
+
+void airbrush(int start, int end, int PStart, int PStop){
+
+
+MotorMoveMM(0,start);
+movePulse(100);
+MotorMoveMM(0,PStart);
+MotorMoveMM(2,20);
+MotorMoveMM(0,PStop);
+MotorMoveMM(2,0);
+movePulse(0);
+MotorMoveMM(0,end);
+}
+
+void FindZero(int whichMotor){
+  volatile stepperInfo& si = Motor[whichMotor];
+  while(digitalRead(si.END_STOP_PIN)==1)  MotorMove(whichMotor,-20000);
+  while(digitalRead(si.END_STOP_PIN)!=1)  MotorMove(whichMotor,1);
+  si.stepPosition = 0;
+  si.RealPosition = 0;
+  Serial.println("");
+  Serial.print("FIND ZERO: Motor: "); Serial.print(whichMotor);
+  Serial.println("");
+}
+
+
+void zero(){
+  char *arg;
+  Serial.println("We're in processCommand");
+  arg = sCmd.next();
+  Serial.println(atoi(arg));
+   FindZero(atoi(arg));
+}
+void amove(){
+  int arg1;
+  long arg2;
+  Serial.println("We're in processCommand");
+  arg1 = atoi(sCmd.next());
+  arg2 = atol(sCmd.next());
+  Serial.println(arg1);
+  Serial.println(arg2);
+MotorMoveABS(arg1,arg2);
+}
+void rmove(){
+  int arg1;
+  long arg2;
+  Serial.println("We're in processCommand");
+  arg1 = atoi(sCmd.next());
+  arg2 = atol(sCmd.next());
+  Serial.println(arg1);
+  Serial.println(arg2);
+  MotorMoveMM(arg1,arg2);
+}
+
+
+void setup() {
+  // Sets the two pins as Outputs
+  Serial.begin(9600);
+
+  pinMode(pinServo,   OUTPUT);
+
+  pinMode(X_STEP_PIN,   OUTPUT);
+  pinMode(X_DIR_PIN,    OUTPUT);
+  pinMode(X_ENABLE_PIN, OUTPUT);
+  pinMode(X_LIMIT, INPUT_PULLUP);
+
+  pinMode(Y_STEP_PIN,   OUTPUT);
+  pinMode(Y_DIR_PIN,    OUTPUT);
+  pinMode(Y_ENABLE_PIN, OUTPUT);
+  pinMode(Y_LIMIT, INPUT_PULLUP);
+
+  pinMode(Z_STEP_PIN,   OUTPUT);
+  pinMode(Z_DIR_PIN,    OUTPUT);
+  pinMode(Z_ENABLE_PIN, OUTPUT);
+  pinMode(Z_LIMIT, INPUT_PULLUP);
+
+
+  digitalWrite(X_ENABLE_PIN, HIGH);
+  digitalWrite(Y_ENABLE_PIN, HIGH);
+  // digitalWrite(Z_ENABLE_PIN, LOW);
+
+  Motor[0].dirFunc = xDir;
+  Motor[0].stepFunc = xStep;
+  Motor[0].SpeedSlow = 5000;
+  Motor[0].SpeedFast = 120;
+  Motor[0].acceleration = 20;
+  Motor[0].minStepInterval = 50;
+  Motor[0].stepPosition = 0;
+  Motor[0].RealPosition = 0;
+  Motor[0].StepRatio = 0.02;
+  Motor[0].MaxPosition = 264; //mm
+  Motor[0].END_STOP_PIN = X_LIMIT;
+
+  Motor[1].dirFunc = yDir;
+  Motor[1].stepFunc = yStep;
+  Motor[1].SpeedSlow = 5000;
+  Motor[1].SpeedFast = 300;
+  Motor[1].acceleration = 20;
+  Motor[1].minStepInterval = 50;
+  Motor[1].stepPosition = 0;
+  Motor[1].RealPosition = 0;
+  Motor[1].StepRatio = 0.0025;
+  Motor[1].MaxPosition = 110; //mm
+  Motor[1].END_STOP_PIN = Y_LIMIT;
+
+  Motor[2].dirFunc = zDir;
+  Motor[2].stepFunc = zStep;
+  Motor[2].SpeedSlow = 5000;
+  Motor[2].SpeedFast = 300;
+  Motor[2].acceleration = 20;
+  Motor[2].minStepInterval = 50;
+  Motor[2].stepPosition = 0;
+  Motor[2].RealPosition = 0;
+  Motor[2].StepRatio = 0.1;
+  Motor[2].MaxPosition = 200; //mm
+  Motor[2].END_STOP_PIN = Y_LIMIT;;
+
+  noInterrupts();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
+
+  OCR1A = 1000;                             // compare value
+  TCCR1B |= (1 << WGM12);                   // CTC mode
+  TCCR1B |= ((1 << CS11) | (1 << CS10));    // 64 prescaler
+  interrupts();
+  // FindZero(0);
+  // FindZero(1);
+  sCmd.addCommand("zero",    zero);
+  sCmd.addCommand("amove",   amove);
+  sCmd.addCommand("rmove",   rmove);
+
+  FindZero(0);
+  airbrush(30, 200, 50, 150);
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+void loop() {
+sCmd.readSerial();
+  // TIMER1_INTERRUPTS_ON
+
+//  movePulse(0);
+//  delay(50);
+//  movePulse(50);
+// delay(50);
+// movePulse(100);
+// delay(50);
+   //
+   // MotorMove(0,5000);
+   // delay(100);
+   //
+   // MotorMove(0,-5000);
+   // delay(100);
+   // FindZero(0);
+   // MotorMove(0,13200);
+   // FindZero(0);
+   // FindZero(1);
+   // delay(10);
+   //
+   // MotorMoveMM(1,110);
+
+   // MotorMoveMM(1,-10);
+   // FindZero(1);
+   // MotorMove(1,3000);
+
+
+
+   // TIMER1_INTERRUPTS_OFF
+  //
+  // MotorMove(1,800);
+  // delay(500);
+  //
+  // MotorMove(1,-800);
+  // delay(500);
+  //
+  // MotorMove(2,800);
+  // delay(500);
+  //
+  // MotorMove(2,-800);
+  // delay(500);
+
+//   for (int i = 0; i <= 120; i += 1) {
+//   servo.write(i);
+//   delay(50); // Wait for 50 millisecond(s)
+// }
+// for (int k = 120; k >= 0; k -= 1) {
+//   servo.write(k);
+//   delay(50); // Wait for 50 millisecond(s)
+// }
+}
